@@ -16,8 +16,8 @@ from telegram.ext import (
 
 # --------------------------- Configuración ---------------------------
 
-# TOKEN desde entorno (Render: TELEGRAM_TOKEN)
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # O fija aquí: TOKEN = "8414398447:AAEJDvaNfFXCrzYtolI2Rbti1uk832XnRh8"
+# TOKEN fijo (local o Render)
+TOKEN = "8414398447:AAEJDvaNfFXCrzYtolI2Rbti1uk832XnRh8"
 
 # Límite global por chat (default 50)
 MSG_LIMIT = int(os.getenv("MSG_LIMIT", "50"))
@@ -119,11 +119,8 @@ async def _reset_counter(chat_id: int):
 async def _check_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Verifica si el usuario es administrador o si el chat es privado."""
     try:
-        # En chat privado (chat_id > 0), el usuario siempre es "admin" para el bot
         if chat_id > 0:
             return True
-        
-        # En grupos/supergrupos, verificar el estado
         member = await context.bot.get_chat_member(chat_id, user_id)
         return member.status in ("creator", "administrator")
     except Exception as e:
@@ -153,34 +150,26 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    
-    # Usamos la nueva función asíncrona para la verificación de administrador
     if not await _check_admin(chat_id, user_id, context):
         return
-        
     current = await _get_count(chat_id)
     await update.message.reply_text(f"📊 Mensajes con keywords: {current}/{MSG_LIMIT}")
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    
-    # Usamos la nueva función asíncrona para la verificación de administrador
     if not await _check_admin(chat_id, user_id, context):
         return
-        
     await _reset_counter(chat_id)
     await update.message.reply_text("🔄 Contador reiniciado.")
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
-
     if not msg or not chat:
         return
     if msg.from_user and msg.from_user.is_bot:
         return
-    # Asegura que solo funcione en grupos/supergrupos
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
@@ -189,15 +178,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     current = await _inc_and_get(chat.id)
-
     if current > MSG_LIMIT:
         try:
-            # Es importante que el bot tenga permisos de administrador para borrar
             await asyncio.sleep(DELETE_DELAY_SEC)
             await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
             logger.info(f"🗑️ Borrado (chat {chat.id}, count={current}).")
         except Exception as e:
-            # Esto puede fallar si el bot no es admin
             logger.warning(f"No se pudo borrar mensaje: {e}")
     else:
         logger.info(f"Keyword detectada. Count={current}/{MSG_LIMIT}.")
@@ -205,14 +191,11 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ------------------------------ App ---------------------------------
 
-# Cambiado de "async def main()" a "def main()" para evitar el error del bucle de eventos
 def main():
     if not TOKEN:
-        # Se detiene si no hay token de Telegram
-        raise RuntimeError("Falta la variable de entorno TELEGRAM_TOKEN.")
+        raise RuntimeError("Falta la variable TELEGRAM_TOKEN.")
 
     _load_counters()
-
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("count", count_cmd))
@@ -225,14 +208,4 @@ def main():
     application.add_handler(MessageHandler(group_filter, group_message_handler))
 
     logger.info("🤖 Charlas Bot escuchando mensajes...")
-    
-    # USAMOS run_polling() SIN ASYNCIO.RUN() EXTERNO PARA RESOLVER EL ERROR EN RENDER.
-    # Eliminamos parámetros como close_loop=False, stop_signals=None
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-    )
-
-if __name__ == "__main__":
-    # La ejecución síncrona llama a la función principal síncrona
-    main()
