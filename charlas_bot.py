@@ -16,7 +16,7 @@ from telegram.ext import (
 
 # --------------------------- Configuración ---------------------------
 
-# TOKEN fijo (local o Render)
+# TOKEN fijo (tu token real, ya insertado)
 TOKEN = "8414398447:AAEJDvaNfFXCrzYtolI2Rbti1uk832XnRh8"
 
 # Límite global por chat (default 50)
@@ -120,7 +120,7 @@ async def _check_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
     """Verifica si el usuario es administrador o si el chat es privado."""
     try:
         if chat_id > 0:
-            return True
+            return True  # En privado, siempre "admin"
         member = await context.bot.get_chat_member(chat_id, user_id)
         return member.status in ("creator", "administrator")
     except Exception as e:
@@ -178,6 +178,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     current = await _inc_and_get(chat.id)
+
     if current > MSG_LIMIT:
         try:
             await asyncio.sleep(DELETE_DELAY_SEC)
@@ -193,9 +194,10 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 def main():
     if not TOKEN:
-        raise RuntimeError("Falta la variable TELEGRAM_TOKEN.")
+        raise RuntimeError("Falta la variable de entorno TELEGRAM_TOKEN.")
 
     _load_counters()
+
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("count", count_cmd))
@@ -209,3 +211,10 @@ def main():
 
     logger.info("🤖 Charlas Bot escuchando mensajes...")
     application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
