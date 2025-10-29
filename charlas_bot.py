@@ -1,145 +1,151 @@
-# charlas_bot.py — Charlas Horizonte Bot
-# Requiere python-telegram-bot==20.3 (ya en requirements.txt)
-# TOKEN se toma de la variable de entorno TELEGRAM_TOKEN (Render)
-
-import os
+import asyncio
+import json
 import logging
-from collections import deque
-from datetime import datetime, timedelta, timezone
-
+import os
+from datetime import datetime, timezone
 from telegram import Update
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    MessageHandler,
-    CommandHandler,
-    filters,
-)
+from telegram.constants import ChatType
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# ----------------- Config -----------------
-# Palabras clave a vigilar (insensible a mayúsculas)
+# ----------------------------------------------------------------------
+# CONFIGURACIÓN
+# ----------------------------------------------------------------------
+
+TOKEN = "8414398447:AAEJDvaNfFXCrzYtolI2Rbti1uk832XnRh8"  # Token fijo del bot
+MSG_LIMIT = 50  # Límite global total de mensajes por chat
+COUNTER_FILE = "counters.json"  # Archivo donde se guardan los contadores
+DELETE_DELAY_SEC = 1.0  # Segundos antes de borrar mensaje extra
+
+# Palabras clave a vigilar
 KEYWORDS = [
-    "kerem",
-    "hulya", "hülya",
-    "asli",
-    "reyhan",
-    "aras",
+    "kerem", "bursin", "bürsin", "inombrable",
+    "hülya", "hulya", "aslı", "asli",
+    "reyhan", "aras", "çarpinti", "çarpıntı"
 ]
 
-# Límite global de mensajes que contienen las palabras clave
-MAX_MESSAGES = 50
+# ----------------------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------------------
 
-# Ventana de tiempo para el conteo (ajústala si lo necesitas)
-# Ahora: 1 hora. Todos los mensajes con keywords en la última hora cuentan.
-TIME_WINDOW = timedelta(hours=1)
-
-# ------------------------------------------
-
-# Log legible en Render
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("charlas_bot")
 
-# Cola de marcas de tiempo (mensajes válidos dentro de la ventana)
-message_log: deque[datetime] = deque()
+_counters = {}
+_lock = asyncio.Lock()
 
+# ----------------------------------------------------------------------
+# FUNCIONES AUXILIARES
+# ----------------------------------------------------------------------
 
-def _prune_old():
-    """Elimina del log los mensajes fuera de la ventana temporal."""
-    cutoff = datetime.now(timezone.utc) - TIME_WINDOW
-    while message_log and message_log[0] < cutoff:
-        message_log.popleft()
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
+def _load_counters():
+    global _counters
+    try:
+        if os.path.exists(COUNTER_FILE):
+            with open(COUNTER_FILE, "r", encoding="utf-8") as f:
+                _counters = json.load(f)
+                if not isinstance(_counters, dict):
+                    _counters = {}
+    except Exception as e:
+        logger.warning(f"No se pudieron cargar contadores: {e}")
+        _counters = {}
 
-def _has_keyword(text: str) -> bool:
-    """Devuelve True si el texto contiene alguna keyword (case-insensitive)."""
-    if not text:
-        return False
-    low = text.lower()
-    return any(k in low for k in KEYWORDS)
+def _save_counters():
+    try:
+        tmp = COUNTER_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_counters, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, COUNTER_FILE)
+    except Exception as e:
+        logger.warning(f"No se pudieron guardar contadores: {e}")
 
+async def _inc_and_get(chat_id: int) -> int:
+    async with _lock:
+        key = str(chat_id)
+        data = _counters.get(key, {"count": 0, "updated_at": _now_iso()})
+        data["count"] = int(data.get("count", 0)) + 1
+        data["updated_at"] = _now_iso()
+        _counters[key] = data
+        _save_counters()
+        return data["count"]
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Maneja CUALQUIER mensaje de texto en el chat.
-    Si contiene una keyword, lo cuenta en el global.
-    A partir del 51 dentro de la ventana, lo borra inmediatamente.
-    """
+async def _get_count(chat_id: int) -> int:
+    async with _lock:
+        return int(_counters.get(str(chat_id), {}).get("count", 0))
+
+async def _reset_counter(chat_id: int):
+    async with _lock:
+        _counters[str(chat_id)] = {"count": 0, "updated_at": _now_iso()}
+        _save_counters()
+
+# ----------------------------------------------------------------------
+# HANDLERS
+# ----------------------------------------------------------------------
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ Charlas Bot operativo.\n"
+        f"• Límite global: {MSG_LIMIT} mensajes.\n"
+        "• Si se supera, los mensajes se borran automáticamente.\n"
+        "• Palabras vigiladas: " + ", ".join(KEYWORDS)
+    )
+
+async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    current = await _get_count(chat_id)
+    await update.message.reply_text(f"📊 Total actual: {current}/{MSG_LIMIT}")
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await _reset_counter(chat_id)
+    await update.message.reply_text("🔄 Contador reiniciado a 0.")
+
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if not msg:
-        return
-
-    # Solo operamos en grupos/supergrupos
     chat = update.effective_chat
-    if not chat or chat.type not in ("group", "supergroup"):
+    text = (msg.text or "").lower()
+
+    if msg.from_user and msg.from_user.is_bot:
         return
 
-    text = msg.text or msg.caption or ""
-    if not _has_keyword(text):
+    if not any(k in text for k in KEYWORDS):
         return
 
-    # Mantenimiento del log
-    _prune_old()
+    current = await _inc_and_get(chat.id)
 
-    # ¿Ya alcanzamos el límite global?
-    if len(message_log) >= MAX_MESSAGES:
-        # Intentar borrar el mensaje que rebasa el límite
+    if current > MSG_LIMIT:
         try:
-            await msg.delete()
-            logger.info("Mensaje eliminado por exceder el límite global de %s.", MAX_MESSAGES)
+            await asyncio.sleep(DELETE_DELAY_SEC)
+            await context.bot.delete_message(chat.id, msg.message_id)
+            logger.info(f"🗑️ Mensaje eliminado (superó {MSG_LIMIT}) en chat {chat.id}")
         except Exception as e:
-            logger.error("No pude eliminar el mensaje que supera el límite: %s", e)
-        return
+            logger.warning(f"No se pudo borrar mensaje {msg.message_id}: {e}")
 
-    # Aún dentro del cupo: registrar el mensaje
-    message_log.append(datetime.now(timezone.utc))
-    logger.info("Keyword detectada. Total en ventana: %s", len(message_log))
+# ----------------------------------------------------------------------
+# APP PRINCIPAL
+# ----------------------------------------------------------------------
 
+def main():
+    _load_counters()
+    app = Application.builder().token(TOKEN).build()
 
-# ---- Comandos útiles (opcionales) ----
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "✅ Charlas Bot listo. Asegúrame permisos para *eliminar mensajes* y "
-        "mantén *Privacy Mode* en OFF.",
-        parse_mode="Markdown",
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("count", count_cmd))
+    app.add_handler(CommandHandler("resetcounter", reset_cmd))
+
+    group_filter = (
+        (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+        & ~filters.StatusUpdate.ALL
     )
+    app.add_handler(MessageHandler(group_filter, group_message_handler))
 
-
-async def cmd_contador(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _prune_old()
-    await update.effective_message.reply_text(
-        f"🧮 Contador global (últimas {int(TIME_WINDOW.total_seconds() // 60)} min): "
-        f"{len(message_log)}/{MAX_MESSAGES}"
-    )
-
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Vacía manualmente el contador (por si lo necesitas)."""
-    message_log.clear()
-    await update.effective_message.reply_text("🔁 Contador global reiniciado.")
-
-
-def main() -> None:
-    token = os.environ.get("TELEGRAM_TOKEN")
-    if not token:
-        raise RuntimeError("Falta la variable de entorno TELEGRAM_TOKEN")
-
-    app = Application.builder().token(token).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("contador", cmd_contador))
-    app.add_handler(CommandHandler("resetcontador", cmd_reset))
-
-    # Cualquier mensaje de texto (no comandos)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Charlas Bot iniciado. Escuchando mensajes…")
-    # Importante: versión sin asyncio.run() para evitar el error del event loop
-    app.run_polling(close_loop=False)
-
+    logger.info("🚀 Charlas Bot iniciado y escuchando mensajes...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 if __name__ == "__main__":
     main()
